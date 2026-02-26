@@ -1,0 +1,211 @@
+"""
+ui/pages/portfolio.py
+Pagina ottimizzazione portafoglio: Markowitz, Black-Litterman, correlazione.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import streamlit as st
+
+from logic.data_fetcher import DataFetcher
+from logic.portfolio_optimizer import (
+    MarkowitzOptimizer, BlackLittermanOptimizer, FactorDecomposer
+)
+
+from ui.components import section_header, metric_card
+from ui.charts import (
+    efficient_frontier_chart, weights_pie, correlation_heatmap
+)
+
+_fetcher = DataFetcher()
+_mvo     = MarkowitzOptimizer()
+_bl      = BlackLittermanOptimizer()
+_fd      = FactorDecomposer()
+
+
+def render():
+    st.title("📐 Ottimizzazione Portafoglio")
+
+    # ---- Input ----
+    st.markdown("#### Inserisci i ticker del portafoglio (separati da virgola o spazio)")
+    raw_tickers = st.text_input(
+        "Tickers",
+        value="AAPL, MSFT, GOOGL, JPM, JNJ",
+        label_visibility="collapsed",
+    )
+    tickers = [t.strip().upper() for t in raw_tickers.replace(",", " ").split() if t.strip()]
+
+    if not tickers or len(tickers) < 2:
+        st.info("Inserisci almeno 2 ticker separati da virgola.")
+        return
+
+    max_w = st.slider("Peso massimo per titolo", 0.10, 1.0, 0.40, 0.05,
+                      format="%.0f%%")
+
+    run = st.button("🚀 Ottimizza", type="primary", use_container_width=True)
+    if not run:
+        return
+
+    # ---- Fetch ----
+    stock_data: dict = {}
+    prog = st.progress(0, text="Caricamento dati...")
+    for i, t in enumerate(tickers):
+        prog.progress((i + 1) / len(tickers), text=f"Fetching {t}...")
+        d = _fetcher.fetch(t)
+        if d is not None:
+            stock_data[t] = d
+        else:
+            st.warning(f"⚠️ Impossibile caricare {t}, escluso.")
+    prog.empty()
+
+    valid_tickers = [t for t in tickers if t in stock_data]
+    if len(valid_tickers) < 2:
+        st.error("Almeno 2 ticker con dati validi richiesti.")
+        return
+
+    # ---- Build returns matrix ----
+    # Allinea per lunghezza minima comune
+    min_len = min(len(stock_data[t].get("daily_returns", [])) for t in valid_tickers)
+    min_len = max(min_len, 30)
+    returns_matrix = np.column_stack([
+        np.array(stock_data[t]["daily_returns"][-min_len:], dtype=float)
+        for t in valid_tickers
+    ])
+
+    # ---- Markowitz ----
+    section_header("Ottimizzazione Markowitz", "📊")
+    col_ms, col_mv = st.columns(2)
+    with col_ms:
+        with st.spinner("Max Sharpe..."):
+            res_sharpe = _mvo.optimize(valid_tickers, returns_matrix,
+                                       objective="max_sharpe", max_weight=max_w)
+        if res_sharpe.get("status") == "ok":
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                metric_card("Rendimento Att.", f"{res_sharpe['portfolio_return_pct']:.2f}%")
+            with c2:
+                metric_card("Volatilità Ann.", f"{res_sharpe['portfolio_vol_pct']:.2f}%")
+            with c3:
+                metric_card("Sharpe Ratio", f"{res_sharpe['portfolio_sharpe']:.3f}")
+            st.plotly_chart(weights_pie(res_sharpe["weights"], "Max Sharpe Weights"),
+                            use_container_width=True)
+        else:
+            st.error(res_sharpe.get("error", "Errore ottimizzazione"))
+
+    with col_mv:
+        with st.spinner("Min Volatility..."):
+            res_minvol = _mvo.optimize(valid_tickers, returns_matrix,
+                                       objective="min_vol", max_weight=max_w)
+        if res_minvol.get("status") == "ok":
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                metric_card("Rendimento Att.", f"{res_minvol['portfolio_return_pct']:.2f}%")
+            with c2:
+                metric_card("Volatilità Ann.", f"{res_minvol['portfolio_vol_pct']:.2f}%")
+            with c3:
+                metric_card("Sharpe Ratio", f"{res_minvol['portfolio_sharpe']:.3f}")
+            st.plotly_chart(weights_pie(res_minvol["weights"], "Min Vol Weights"),
+                            use_container_width=True)
+        else:
+            st.error(res_minvol.get("error", "Errore ottimizzazione"))
+
+    # ---- Efficient Frontier ----
+    section_header("Frontiera Efficiente", "🌐")
+    with st.spinner("Calcolo frontiera efficiente..."):
+        frontier = _mvo.efficient_frontier(valid_tickers, returns_matrix, max_weight=max_w)
+    st.plotly_chart(
+        efficient_frontier_chart(
+            frontier,
+            opt_portfolio=res_sharpe if res_sharpe.get("status") == "ok" else None,
+        ),
+        use_container_width=True,
+    )
+
+    # ---- Black-Litterman ----
+    section_header("Black-Litterman", "🔮")
+    with st.expander("➕ Aggiungi Views (opzionale)", expanded=False):
+        st.caption("Definisci le tue aspettative di rendimento per uno o più titoli")
+        views: list = []
+        for t in valid_tickers:
+            col_t, col_v, col_conf = st.columns([2, 2, 1])
+            with col_t:
+                st.markdown(f"**{t}**")
+            with col_v:
+                ret_view = st.number_input(
+                    f"Expected return {t} (%)", min_value=-50.0, max_value=100.0,
+                    value=0.0, step=0.5, key=f"bl_view_{t}",
+                    label_visibility="collapsed",
+                )
+            with col_conf:
+                active = st.checkbox("Attiva", key=f"bl_active_{t}")
+            if active and ret_view != 0.0:
+                views.append({"assets": [t], "returns": [ret_view / 100.0]})
+
+    with st.spinner("Black-Litterman..."):
+        bl_res = _bl.optimize(valid_tickers, returns_matrix, views=views or None)
+
+    if bl_res.get("status") == "ok":
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            metric_card("Rendimento Att.", f"{bl_res['portfolio_return_pct']:.2f}%")
+        with c2:
+            metric_card("Volatilità Ann.", f"{bl_res['portfolio_vol_pct']:.2f}%")
+        with c3:
+            metric_card("Sharpe Ratio", f"{bl_res['portfolio_sharpe']:.3f}")
+        st.plotly_chart(weights_pie(bl_res["weights"], "Black-Litterman Weights"),
+                        use_container_width=True)
+        st.plotly_chart(
+            efficient_frontier_chart(
+                frontier,
+                opt_portfolio=res_sharpe if res_sharpe.get("status") == "ok" else None,
+                bl_portfolio=bl_res,
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.error(bl_res.get("error", "Errore BL"))
+
+    # ---- Correlazione ----
+    section_header("Correlazione Rendimenti", "🔗")
+    st.plotly_chart(
+        correlation_heatmap(valid_tickers, returns_matrix),
+        use_container_width=True,
+    )
+
+    # ---- Factor Decomposition ----
+    section_header("Fama-French Factor Decomposition", "🧮")
+    with st.spinner("Decomposizione fattoriale..."):
+        market_caps = [
+            stock_data[t].get("market_cap") for t in valid_tickers
+        ]
+        pb_ratios = [
+            stock_data[t].get("fundamentals", {}).get("pb_ratio") for t in valid_tickers
+        ]
+        r12m_pcts = [
+            stock_data[t].get("technicals", {}).get("r12m") for t in valid_tickers
+        ]
+        factor_res = _fd.decompose(
+            valid_tickers, returns_matrix,
+            market_caps=market_caps, pb_ratios=pb_ratios, r12m_pcts=r12m_pcts,
+        )
+
+    if factor_res.get("status") == "ok":
+        fr = factor_res.get("factor_returns", {})
+        c1, c2, c3, c4 = st.columns(4)
+        for col, (fac, val) in zip([c1, c2, c3, c4], fr.items()):
+            with col:
+                metric_card(fac, f"{val:.2f}%", delta_positive=(val >= 0))
+
+        st.markdown("**Esposizioni per titolo:**")
+        import pandas as pd
+        rows = []
+        for t in valid_tickers:
+            exp = factor_res["exposures"].get(t, {})
+            row = {"Ticker": t, "Alpha Ann.": f"{exp.get('alpha_annual', 0)*100:.2f}%"}
+            for fac in ["MKT", "SMB", "HML", "MOM"]:
+                row[fac] = f"{exp.get('betas', {}).get(fac, 0):.3f}"
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows).set_index("Ticker"), use_container_width=True)
+    else:
+        st.warning(factor_res.get("error", "Decomposizione non disponibile"))
